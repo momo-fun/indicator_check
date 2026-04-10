@@ -8,7 +8,7 @@ Hypothesis:
     When the price is at a local trough AND Fisher < (mean - 2*std),
     the forward price returns should be positive more often than not.
 
-Tickers : GL, AJG, WFC, NOW, SMG, MSGS, CRM, UBER  (daily)
+Tickers : all S&P 500 constituents scraped from Wikipedia at runtime
 Data     : yfinance (5 years), with synthetic GBM fallback when offline
 Extrema  : scipy.signal.argrelextrema, order=10
 """
@@ -32,10 +32,7 @@ import matplotlib.gridspec as gridspec
 # Used when yfinance cannot reach the network.
 # Seeds are fixed per ticker so results are reproducible.
 # ─────────────────────────────────────────────────────────────────────────────
-_TICKER_SEEDS = {
-    "GL":   10, "AJG":  20, "WFC":  30, "NOW":  40,
-    "SMG":  50, "MSGS": 60, "CRM":  70, "UBER": 80,
-}
+_TICKER_SEEDS: dict[str, int] = {}   # populated lazily from SP500_TICKERS
 
 def _make_synthetic(ticker: str, n_days: int = 1260) -> pd.DataFrame:
     """
@@ -46,7 +43,7 @@ def _make_synthetic(ticker: str, n_days: int = 1260) -> pd.DataFrame:
     Adds occasional mean-reverting 'shock' clusters so argrelextrema finds
     a reasonable number of local extrema at order=10.
     """
-    rng  = np.random.default_rng(_TICKER_SEEDS.get(ticker, 0))
+    rng  = np.random.default_rng(_TICKER_SEEDS.get(ticker, hash(ticker) & 0xFFFF))
     mu   = 0.08 / 252          # daily drift
     sig  = 0.25 / np.sqrt(252) # daily vol
 
@@ -77,9 +74,29 @@ def _make_synthetic(ticker: str, n_days: int = 1260) -> pd.DataFrame:
     }, index=dates)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# S&P 500 ticker list (scraped from Wikipedia at startup)
+# ─────────────────────────────────────────────────────────────────────────────
+_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+def _load_sp500_tickers() -> list[str]:
+    """Return current S&P 500 tickers from Wikipedia, falling back to a small
+    default list when the network is unavailable."""
+    try:
+        tables = pd.read_html(_WIKI_URL, attrs={"id": "constituents"})
+        tickers = tables[0]["Symbol"].tolist()
+        # yfinance uses '-' where Wikipedia uses '.' (e.g. BRK.B → BRK-B)
+        return [t.replace(".", "-") for t in tickers]
+    except Exception as exc:
+        _FALLBACK = ["GL", "AJG", "WFC", "NOW", "SMG", "MSGS", "CRM", "UBER"]
+        print(f"[WARN] Could not fetch S&P 500 list from Wikipedia "
+              f"({exc.__class__.__name__}). Falling back to {len(_FALLBACK)} tickers.")
+        return _FALLBACK
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
-TICKERS      = ["GL", "AJG", "WFC", "NOW", "SMG", "MSGS", "CRM", "UBER"]
+TICKERS      = _load_sp500_tickers()
 PERIOD       = "5y"          # 5 years of daily data (yfinance)
 ORDER        = 10            # argrelextrema neighbourhood
 LEN_PRICE    = 9             # Fisher price lookback
@@ -188,11 +205,7 @@ for idx, ticker in enumerate(TICKERS):
     #
     # Priority 1: local CSV  (price_data/<TICKER>.csv)
     #   Produce these on any internet-connected machine with:
-    #     import yfinance as yf, os
-    #     os.makedirs("price_data", exist_ok=True)
-    #     for t in ["GL","AJG","WFC","NOW","SMG","MSGS","CRM","UBER"]:
-    #         yf.download(t, period="5y", interval="1d",
-    #                     auto_adjust=True, progress=False).to_csv(f"price_data/{t}.csv")
+    #     python download_sp500.py
     #   then copy the price_data/ folder into this directory.
     #
     # Priority 2: yfinance live download (requires internet access)
