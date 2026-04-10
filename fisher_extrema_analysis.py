@@ -201,7 +201,13 @@ for idx, ticker in enumerate(TICKERS):
 
     csv_path = os.path.join(DATA_DIR, f"{ticker}.csv")
     if os.path.isfile(csv_path):
-        df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+        # yfinance saves CSVs with 3 header rows:
+        #   row 0: Price, Close, High, Low, Open, Volume
+        #   row 1: Ticker, GL, GL, ...
+        #   row 2: Date, , , ...
+        # Skip rows 1 & 2, use row 0 as column names, col 0 as DatetimeIndex.
+        df = pd.read_csv(csv_path, header=0, skiprows=[1, 2],
+                         index_col=0, parse_dates=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.dropna(subset=["Close"])
