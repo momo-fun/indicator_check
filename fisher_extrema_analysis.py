@@ -79,7 +79,6 @@ def _make_synthetic(ticker: str, n_days: int = 1260) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
-TICKERS      = ["GL", "AJG", "WFC", "NOW", "SMG", "MSGS", "CRM", "UBER"]
 PERIOD       = "5y"          # 5 years of daily data (yfinance)
 ORDER        = 10            # argrelextrema neighbourhood
 LEN_PRICE    = 9             # Fisher price lookback
@@ -91,6 +90,14 @@ FORWARD_DAYS = [1, 5, 10, 20]  # forward windows to test
 # Directory that holds pre-downloaded CSVs (one file per ticker).
 # Override via env var:  DATA_DIR=/path/to/csvs python fisher_extrema_analysis.py
 DATA_DIR     = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "price_data"))
+
+# Auto-detect tickers from CSV files; fall back to original 8 if folder is empty.
+_csv_files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".csv")) if os.path.isdir(DATA_DIR) else []
+TICKERS     = [os.path.splitext(f)[0] for f in _csv_files] or \
+              ["GL", "AJG", "WFC", "NOW", "SMG", "MSGS", "CRM", "UBER"]
+
+# Per-ticker charts are useful for small sets; skip when > this threshold.
+CHART_TICKER_LIMIT = 20
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,44 +181,35 @@ def stats_block(returns: np.ndarray) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # Main analysis loop
 # ─────────────────────────────────────────────────────────────────────────────
-all_results = []   # rows for cross-ticker summary
+all_results  = []    # one row per (ticker, fwd_days)
+skipped      = []
+do_charts    = len(TICKERS) <= CHART_TICKER_LIMIT
 
-n_tickers = len(TICKERS)
-fig = plt.figure(figsize=(22, n_tickers * 7))
-gs  = gridspec.GridSpec(n_tickers, 2, figure=fig, hspace=0.55, wspace=0.3)
+if do_charts:
+    fig = plt.figure(figsize=(22, len(TICKERS) * 7))
+    gs  = gridspec.GridSpec(len(TICKERS), 2, figure=fig, hspace=0.55, wspace=0.3)
 
-for idx, ticker in enumerate(TICKERS):
-    sep = "=" * 65
-    print(f"\n{sep}\n  {ticker}\n{sep}")
+print(f"[INFO] Processing {len(TICKERS)} tickers "
+      f"({'with' if do_charts else 'without'} per-ticker charts) …\n")
 
+for idx, ticker in enumerate(TICKERS, 1):
     # ── Data loading: local CSV → yfinance → synthetic GBM ──────────────────
-    #
-    # Priority 1: local CSV  (price_data/<TICKER>.csv)
-    #   Produce these on any internet-connected machine with:
-    #     import yfinance as yf, os
-    #     os.makedirs("price_data", exist_ok=True)
-    #     for t in ["GL","AJG","WFC","NOW","SMG","MSGS","CRM","UBER"]:
-    #         yf.download(t, period="5y", interval="1d",
-    #                     auto_adjust=True, progress=False).to_csv(f"price_data/{t}.csv")
-    #   then copy the price_data/ folder into this directory.
-    #
-    # Priority 2: yfinance live download (requires internet access)
-    #
-    # Priority 3: synthetic GBM — fully offline, reproducible, for smoke-testing
-
     csv_path = os.path.join(DATA_DIR, f"{ticker}.csv")
     if os.path.isfile(csv_path):
-        # yfinance saves CSVs with 3 header rows:
-        #   row 0: Price, Close, High, Low, Open, Volume
-        #   row 1: Ticker, GL, GL, ...
-        #   row 2: Date, , , ...
-        # Skip rows 1 & 2, use row 0 as column names, col 0 as DatetimeIndex.
-        df = pd.read_csv(csv_path, header=0, skiprows=[1, 2],
-                         index_col=0, parse_dates=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.dropna(subset=["Close"])
-        data_source = f"local CSV ({csv_path})"
+        try:
+            # yfinance CSVs have 3 header rows: Price / Ticker / Date label.
+            # Skip rows 1 & 2, use row 0 as column names, col 0 as index.
+            df = pd.read_csv(csv_path, header=0, skiprows=[1, 2],
+                             index_col=0, parse_dates=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna(subset=["Close"])
+            if df.empty:
+                raise ValueError("empty after dropna")
+            data_source = "CSV"
+        except Exception as e:
+            skipped.append((ticker, str(e)))
+            continue
     else:
         try:
             df = yf.download(ticker, period=PERIOD, interval="1d",
@@ -222,14 +220,10 @@ for idx, ticker in enumerate(TICKERS):
                 raise ValueError("empty download")
             df = df.dropna(subset=["Close"])
             data_source = "yfinance"
-        except Exception as exc:
-            print(f"  [WARN] yfinance failed ({exc.__class__.__name__}). "
-                  f"Using synthetic GBM data.\n"
-                  f"  Tip : place real CSVs in {DATA_DIR}/<TICKER>.csv to use real data.")
+        except Exception:
             df = _make_synthetic(ticker)
-            data_source = "synthetic GBM"
+            data_source = "synthetic"
 
-    print(f"  Data source : {data_source}  |  bars={len(df)}")
     close = df["Close"].values.astype(float)
 
     # ── Fisher indicator ─────────────────────────────────────────────────────
@@ -240,7 +234,6 @@ for idx, ticker in enumerate(TICKERS):
     ilocs_max_all = argrelextrema(close, np.greater_equal, order=ORDER)[0]
     ilocs_min_all = argrelextrema(close, np.less_equal,   order=ORDER)[0]
 
-    # Require enough warm-up bars and at least max(FORWARD_DAYS) left
     warm    = LEN_PRICE + LEN_LR
     max_fwd = max(FORWARD_DAYS)
     valid_min = ilocs_min_all[(ilocs_min_all >= warm) &
@@ -248,16 +241,11 @@ for idx, ticker in enumerate(TICKERS):
     valid_max = ilocs_max_all[(ilocs_max_all >= warm) &
                               (ilocs_max_all <= len(close) - max_fwd - 1)]
 
-    # ── Fisher statistics (full series, post warm-up) ────────────────────────
+    # ── Fisher statistics ─────────────────────────────────────────────────────
     fish_series = fish[warm:]
     f_mean  = np.nanmean(fish_series)
     f_std   = np.nanstd(fish_series)
-    thresh  = f_mean - 2.0 * f_std    # "extreme low" threshold
-
-    print(f"  Fisher  mean={f_mean:+.3f}  std={f_std:.3f}  "
-          f"threshold(mean-2σ)={thresh:+.3f}")
-    print(f"  Troughs (valid): {len(valid_min)}  |  "
-          f"Peaks (valid): {len(valid_max)}")
+    thresh  = f_mean - 2.0 * f_std
 
     # ── Classify troughs ─────────────────────────────────────────────────────
     fisher_at_troughs = fish[valid_min]
@@ -265,128 +253,183 @@ for idx, ticker in enumerate(TICKERS):
     extreme_locs      = valid_min[extreme_mask]
     normal_locs       = valid_min[~extreme_mask]
 
-    print(f"  Extreme troughs (Fisher < {thresh:+.3f}): {len(extreme_locs)}")
-    print(f"  Normal  troughs                         : {len(normal_locs)}")
-
     # ── Forward returns ──────────────────────────────────────────────────────
-    hdr = (f"  {'Days':>5s}  |  {'Extreme':>7s}  {'Ext-WR%':>8s}  "
-           f"{'N-ext':>5s}  |  {'Normal':>7s}  {'Nor-WR%':>8s}  {'N-nor':>5s}")
-    print(f"\n{hdr}")
-    print("  " + "-" * (len(hdr) - 2))
-
     for fwd in FORWARD_DAYS:
-        ext_ret  = forward_returns(close, extreme_locs, fwd)
-        nor_ret  = forward_returns(close, normal_locs,  fwd)
+        ext_ret = forward_returns(close, extreme_locs, fwd)
+        nor_ret = forward_returns(close, normal_locs,  fwd)
         es = stats_block(ext_ret)
         ns = stats_block(nor_ret)
-
-        print(f"  {fwd:>5d}d  |  "
-              f"{es['mean']:>+7.2f}%  {es['win_rate']:>7.1f}%  {es['n']:>5d}  |  "
-              f"{ns['mean']:>+7.2f}%  {ns['win_rate']:>7.1f}%  {ns['n']:>5d}")
-
         all_results.append(dict(
-            ticker          = ticker,
-            fwd_days        = fwd,
-            # extreme-trough stats
-            ext_n           = es["n"],
-            ext_mean_ret    = es["mean"],
-            ext_win_rate    = es["win_rate"],
-            # normal-trough stats
-            nor_n           = ns["n"],
-            nor_mean_ret    = ns["mean"],
-            nor_win_rate    = ns["win_rate"],
+            ticker       = ticker,
+            data_source  = data_source,
+            bars         = len(close),
+            fwd_days     = fwd,
+            f_mean       = round(f_mean, 4),
+            f_std        = round(f_std,  4),
+            thresh       = round(thresh, 4),
+            n_troughs    = len(valid_min),
+            ext_n        = es["n"],
+            ext_mean_ret = es["mean"],
+            ext_median   = es["median"],
+            ext_win_rate = es["win_rate"],
+            nor_n        = ns["n"],
+            nor_mean_ret = ns["mean"],
+            nor_median   = ns["median"],
+            nor_win_rate = ns["win_rate"],
         ))
 
-    # ── Plot: Price panel ────────────────────────────────────────────────────
-    ax1 = fig.add_subplot(gs[idx, 0])
-    ax1.set_title(f"{ticker}  –  Price with Extrema", fontsize=10, fontweight="bold")
-    ax1.plot(df.index, close, color="black", linewidth=0.9, label="Close")
+    # Progress heartbeat every 50 tickers
+    if idx % 50 == 0 or idx == len(TICKERS):
+        print(f"  … {idx}/{len(TICKERS)} done")
 
-    if len(valid_min) > 0:
-        ax1.scatter(df.index[valid_min], close[valid_min],
-                    color="green", marker="^", s=50, zorder=5, label="Trough")
-    if len(valid_max) > 0:
-        ax1.scatter(df.index[valid_max], close[valid_max],
-                    color="red", marker="v", s=50, zorder=5, label="Peak")
-    if len(extreme_locs) > 0:
-        ax1.scatter(df.index[extreme_locs], close[extreme_locs],
-                    color="blue", marker="*", s=130, zorder=6,
-                    label=f"Extreme trough\n(Fisher<{thresh:+.2f})")
+    # ── Per-ticker charts (only when ticker count is small) ──────────────────
+    if do_charts:
+        chart_idx = idx - 1
+        ax1 = fig.add_subplot(gs[chart_idx, 0])
+        ax1.set_title(f"{ticker}  –  Price with Extrema", fontsize=10, fontweight="bold")
+        ax1.plot(df.index, close, color="black", linewidth=0.9, label="Close")
+        if len(valid_min) > 0:
+            ax1.scatter(df.index[valid_min], close[valid_min],
+                        color="green", marker="^", s=50, zorder=5, label="Trough")
+        if len(valid_max) > 0:
+            ax1.scatter(df.index[valid_max], close[valid_max],
+                        color="red", marker="v", s=50, zorder=5, label="Peak")
+        if len(extreme_locs) > 0:
+            ax1.scatter(df.index[extreme_locs], close[extreme_locs],
+                        color="blue", marker="*", s=130, zorder=6,
+                        label=f"Extreme (Fisher<{thresh:+.2f})")
+        ax1.legend(fontsize=7, loc="upper left")
+        ax1.set_ylabel("Price")
+        ax1.tick_params(axis="x", labelrotation=30, labelsize=7)
 
-    ax1.legend(fontsize=7, loc="upper left")
-    ax1.set_ylabel("Price")
-    ax1.tick_params(axis="x", labelrotation=30, labelsize=7)
+        ax2 = fig.add_subplot(gs[chart_idx, 1])
+        ax2.set_title(f"{ticker}  –  Fisher Transform", fontsize=10, fontweight="bold")
+        ax2.plot(df.index, fish,     color="steelblue",  linewidth=1.4, label="Fisher")
+        ax2.plot(df.index, trigger,  color="gray",       linewidth=0.8, alpha=0.6, label="Trigger")
+        ax2.plot(df.index, rma_fish, color="royalblue",  linewidth=1.2, linestyle="--", label="RMA")
+        ax2.plot(df.index, lr_fish,  color="darkorchid", linewidth=1.2, linestyle="--", label="LR")
+        ax2.axhline(0,      color="gray",       linewidth=0.8)
+        ax2.axhline( BAND,  color="lightgray",  linewidth=1.0, linestyle="--")
+        ax2.axhline(-BAND,  color="lightgray",  linewidth=1.0, linestyle="--")
+        ax2.axhline(thresh, color="darkorange", linewidth=1.5, linestyle=":",
+                    label=f"mean−2σ={thresh:+.2f}")
+        if len(valid_min) > 0:
+            ax2.scatter(df.index[valid_min], fish[valid_min],
+                        color="green", marker="^", s=50, zorder=5)
+        if len(extreme_locs) > 0:
+            ax2.scatter(df.index[extreme_locs], fish[extreme_locs],
+                        color="blue", marker="*", s=130, zorder=6)
+        ax2.legend(fontsize=7, loc="upper left", ncol=2)
+        ax2.set_ylabel("Fisher Value")
+        ax2.tick_params(axis="x", labelrotation=30, labelsize=7)
 
-    # ── Plot: Fisher panel ───────────────────────────────────────────────────
-    ax2 = fig.add_subplot(gs[idx, 1])
-    ax2.set_title(f"{ticker}  –  Fisher Transform", fontsize=10, fontweight="bold")
+if skipped:
+    print(f"\n[WARN] Skipped {len(skipped)} tickers: {[t for t,_ in skipped]}")
 
-    ax2.plot(df.index, fish,     color="steelblue",   linewidth=1.4, label="Fisher")
-    ax2.plot(df.index, trigger,  color="gray",        linewidth=0.8, alpha=0.6, label="Trigger")
-    ax2.plot(df.index, rma_fish, color="royalblue",   linewidth=1.2, linestyle="--", label="RMA(Fisher)")
-    ax2.plot(df.index, lr_fish,  color="darkorchid",  linewidth=1.2, linestyle="--", label="LR(Fisher)")
-
-    ax2.axhline(0,      color="gray",      linewidth=0.8, linestyle="-")
-    ax2.axhline( BAND,  color="lightgray", linewidth=1.0, linestyle="--", label=f"±{BAND}")
-    ax2.axhline(-BAND,  color="lightgray", linewidth=1.0, linestyle="--")
-    ax2.axhline(thresh, color="darkorange",linewidth=1.5, linestyle=":", label=f"mean−2σ={thresh:+.2f}")
-
-    if len(valid_min) > 0:
-        ax2.scatter(df.index[valid_min], fish[valid_min],
-                    color="green", marker="^", s=50, zorder=5)
-    if len(extreme_locs) > 0:
-        ax2.scatter(df.index[extreme_locs], fish[extreme_locs],
-                    color="blue", marker="*", s=130, zorder=6)
-
-    ax2.legend(fontsize=7, loc="upper left", ncol=2)
-    ax2.set_ylabel("Fisher Value")
-    ax2.tick_params(axis="x", labelrotation=30, labelsize=7)
-
-plt.savefig("fisher_analysis.png", dpi=120, bbox_inches="tight")
-plt.close()
-print("\n[INFO] Chart saved → fisher_analysis.png")
+if do_charts:
+    plt.savefig("fisher_analysis.png", dpi=120, bbox_inches="tight")
+    plt.close()
+    print("\n[INFO] Per-ticker chart saved → fisher_analysis.png")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cross-ticker aggregated summary
+# Cross-ticker aggregated summary + summary chart
 # ─────────────────────────────────────────────────────────────────────────────
-if all_results:
+if not all_results:
+    print("[ERROR] No results collected.")
+else:
     df_res = pd.DataFrame(all_results)
 
-    print("\n" + "=" * 65)
-    print("CROSS-TICKER SUMMARY  –  Extreme Troughs (Fisher < mean−2σ)")
-    print("=" * 65)
+    # Save full per-ticker results to CSV
+    df_res.to_csv("fisher_results_full.csv", index=False)
+    print(f"[INFO] Full results saved → fisher_results_full.csv  "
+          f"({len(df_res)} rows, {df_res['ticker'].nunique()} tickers)")
 
+    # Aggregate across all tickers
     agg = df_res.groupby("fwd_days").agg(
+        tickers_with_data     = ("ticker",       "nunique"),
         total_extreme_signals = ("ext_n",        "sum"),
-        avg_return_pct        = ("ext_mean_ret", "mean"),
-        avg_win_rate_pct      = ("ext_win_rate", "mean"),
-        avg_normal_return_pct = ("nor_mean_ret", "mean"),
-        avg_normal_win_rate   = ("nor_win_rate", "mean"),
-    )
+        total_normal_signals  = ("nor_n",        "sum"),
+        ext_mean_ret          = ("ext_mean_ret", "mean"),
+        ext_median_ret        = ("ext_median",   "mean"),
+        ext_win_rate          = ("ext_win_rate", "mean"),
+        nor_mean_ret          = ("nor_mean_ret", "mean"),
+        nor_median_ret        = ("nor_median",   "mean"),
+        nor_win_rate          = ("nor_win_rate", "mean"),
+    ).round(2)
 
-    print(agg.round(2).to_string())
+    print("\n" + "=" * 75)
+    print(f"CROSS-TICKER SUMMARY  ({df_res['ticker'].nunique()} tickers, "
+          f"Fisher < mean−2σ  vs  normal troughs)")
+    print("=" * 75)
+    print(agg.to_string())
 
     print("\nPrediction Verdict  (Extreme Trough vs Normal Trough)")
-    print("-" * 65)
+    print("-" * 75)
+    verdicts = {}
     for fwd, row in agg.iterrows():
-        ext_wr = row["avg_win_rate_pct"]
-        ext_rt = row["avg_return_pct"]
-        nor_wr = row["avg_normal_win_rate"]
-        nor_rt = row["avg_normal_return_pct"]
-
-        edge_wr = ext_wr - nor_wr
-        edge_rt = ext_rt - nor_rt
-
-        verdict = ("STRONG EDGE" if ext_wr > 65 and edge_wr > 5
-                   else "MODERATE EDGE" if ext_wr > 55 and edge_wr > 0
+        ext_wr  = row["ext_win_rate"]
+        nor_wr  = row["nor_win_rate"]
+        ext_rt  = row["ext_mean_ret"]
+        nor_rt  = row["nor_mean_ret"]
+        dwr     = ext_wr - nor_wr
+        drt     = ext_rt - nor_rt
+        verdict = ("STRONG EDGE"   if ext_wr > 65 and dwr > 5
+                   else "MODERATE EDGE" if ext_wr > 55 and dwr > 0
                    else "NO CLEAR EDGE")
-
+        verdicts[fwd] = verdict
+        n_ext = int(row["total_extreme_signals"])
         print(f"  {fwd:>2d}d  ExtWR={ext_wr:.1f}%  NorWR={nor_wr:.1f}%  "
-              f"ΔWR={edge_wr:+.1f}pp  ΔReturn={edge_rt:+.2f}%  → {verdict}")
+              f"ΔWR={dwr:+.1f}pp  ΔReturn={drt:+.2f}%  "
+              f"N={n_ext:,}  → {verdict}")
 
     print("\nInterpretation Guide")
-    print("  STRONG EDGE    : Fisher<mean−2σ at troughs wins >65% of the time,")
-    print("                   at least 5pp better win-rate than ordinary troughs.")
-    print("  MODERATE EDGE  : Win-rate > 55%, positive edge but weaker.")
-    print("  NO CLEAR EDGE  : Indicator does not reliably predict upward moves.")
+    print("  STRONG EDGE    : Fisher<mean−2σ at troughs wins >65%, ≥5pp above normal.")
+    print("  MODERATE EDGE  : Win-rate >55%, positive edge but weaker.")
+    print("  NO CLEAR EDGE  : Indicator does not reliably outperform any trough.")
+
+    # ── Summary chart ────────────────────────────────────────────────────────
+    fwd_labels  = [f"{f}d" for f in agg.index]
+    x           = np.arange(len(fwd_labels))
+    width       = 0.35
+
+    fig2, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig2.suptitle(
+        f"Fisher Transform Extrema Analysis  –  {df_res['ticker'].nunique()} US Stocks  "
+        f"(daily, 5y)\nExtreme trough = Fisher < mean−2σ at argrelextrema trough (order=10)",
+        fontsize=11, fontweight="bold"
+    )
+
+    # Left: win rate comparison
+    ax = axes[0]
+    bars1 = ax.bar(x - width/2, agg["ext_win_rate"], width,
+                   label="Extreme trough", color="steelblue", alpha=0.85)
+    bars2 = ax.bar(x + width/2, agg["nor_win_rate"], width,
+                   label="Normal trough",  color="lightcoral", alpha=0.85)
+    ax.axhline(50, color="gray", linewidth=1, linestyle="--", label="50% baseline")
+    ax.set_xticks(x); ax.set_xticklabels(fwd_labels)
+    ax.set_ylabel("Win Rate (%)"); ax.set_title("Forward Win Rate")
+    ax.set_ylim(0, 110); ax.legend(fontsize=9)
+    for bar in list(bars1) + list(bars2):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                f"{bar.get_height():.1f}%", ha="center", va="bottom", fontsize=8)
+
+    # Right: mean return comparison
+    ax = axes[1]
+    bars3 = ax.bar(x - width/2, agg["ext_mean_ret"], width,
+                   label="Extreme trough", color="steelblue", alpha=0.85)
+    bars4 = ax.bar(x + width/2, agg["nor_mean_ret"], width,
+                   label="Normal trough",  color="lightcoral", alpha=0.85)
+    ax.axhline(0, color="gray", linewidth=1, linestyle="--")
+    ax.set_xticks(x); ax.set_xticklabels(fwd_labels)
+    ax.set_ylabel("Avg Return (%)"); ax.set_title("Avg Forward Return")
+    ax.legend(fontsize=9)
+    for bar in list(bars3) + list(bars4):
+        ypos = bar.get_height() + (0.1 if bar.get_height() >= 0 else -0.4)
+        ax.text(bar.get_x() + bar.get_width()/2, ypos,
+                f"{bar.get_height():+.2f}%", ha="center", va="bottom", fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig("fisher_summary_chart.png", dpi=130, bbox_inches="tight")
+    plt.close()
+    print("\n[INFO] Summary chart saved → fisher_summary_chart.png")
