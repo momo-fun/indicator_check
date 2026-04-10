@@ -13,6 +13,7 @@ Data     : yfinance (5 years), with synthetic GBM fallback when offline
 Extrema  : scipy.signal.argrelextrema, order=10
 """
 
+import os
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -79,13 +80,17 @@ def _make_synthetic(ticker: str, n_days: int = 1260) -> pd.DataFrame:
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 TICKERS      = ["GL", "AJG", "WFC", "NOW", "SMG", "MSGS", "CRM", "UBER"]
-PERIOD       = "5y"          # 5 years of daily data
+PERIOD       = "5y"          # 5 years of daily data (yfinance)
 ORDER        = 10            # argrelextrema neighbourhood
 LEN_PRICE    = 9             # Fisher price lookback
 LEN_RMA      = 9             # RMA (Wilder MA) length
 LEN_LR       = 20            # Linear-regression length
 BAND         = 2.0           # ±2 Fisher static bands (same as PineScript)
 FORWARD_DAYS = [1, 5, 10, 20]  # forward windows to test
+
+# Directory that holds pre-downloaded CSVs (one file per ticker).
+# Override via env var:  DATA_DIR=/path/to/csvs python fisher_extrema_analysis.py
+DATA_DIR     = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "price_data"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,22 +184,44 @@ for idx, ticker in enumerate(TICKERS):
     sep = "=" * 65
     print(f"\n{sep}\n  {ticker}\n{sep}")
 
-    # ── Download (with synthetic fallback when offline) ──────────────────────
-    try:
-        df = yf.download(ticker, period=PERIOD, interval="1d",
-                         auto_adjust=True, progress=False)
-        # yfinance may return MultiIndex columns; flatten
+    # ── Data loading: local CSV → yfinance → synthetic GBM ──────────────────
+    #
+    # Priority 1: local CSV  (price_data/<TICKER>.csv)
+    #   Produce these on any internet-connected machine with:
+    #     import yfinance as yf, os
+    #     os.makedirs("price_data", exist_ok=True)
+    #     for t in ["GL","AJG","WFC","NOW","SMG","MSGS","CRM","UBER"]:
+    #         yf.download(t, period="5y", interval="1d",
+    #                     auto_adjust=True, progress=False).to_csv(f"price_data/{t}.csv")
+    #   then copy the price_data/ folder into this directory.
+    #
+    # Priority 2: yfinance live download (requires internet access)
+    #
+    # Priority 3: synthetic GBM — fully offline, reproducible, for smoke-testing
+
+    csv_path = os.path.join(DATA_DIR, f"{ticker}.csv")
+    if os.path.isfile(csv_path):
+        df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if df.empty or "Close" not in df.columns:
-            raise ValueError("empty download")
         df = df.dropna(subset=["Close"])
-        data_source = "yfinance"
-    except Exception as exc:
-        print(f"  [WARN] yfinance failed ({exc.__class__.__name__}). "
-              f"Using synthetic GBM data for demonstration.")
-        df = _make_synthetic(ticker)
-        data_source = "synthetic GBM"
+        data_source = f"local CSV ({csv_path})"
+    else:
+        try:
+            df = yf.download(ticker, period=PERIOD, interval="1d",
+                             auto_adjust=True, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if df.empty or "Close" not in df.columns:
+                raise ValueError("empty download")
+            df = df.dropna(subset=["Close"])
+            data_source = "yfinance"
+        except Exception as exc:
+            print(f"  [WARN] yfinance failed ({exc.__class__.__name__}). "
+                  f"Using synthetic GBM data.\n"
+                  f"  Tip : place real CSVs in {DATA_DIR}/<TICKER>.csv to use real data.")
+            df = _make_synthetic(ticker)
+            data_source = "synthetic GBM"
 
     print(f"  Data source : {data_source}  |  bars={len(df)}")
     close = df["Close"].values.astype(float)
